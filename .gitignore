@@ -1,0 +1,16 @@
+.zig-cache/
+zig-out/
+bin/
+artifacts/
+*.pem
+*.app/
+request*.txt
+response*.txt
+*.key
+*.p12
+*.pfx
+*.signature-backup-*/
+.env
+.env.*
+!.env.example
+.DS_Store

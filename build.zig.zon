@@ -1,0 +1,17 @@
+.{
+    .name = .lejav_gen_navicat,
+    .version = "0.4.1",
+    .fingerprint = 0x131385353eaa5ebc,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tools",
+        "README.md",
+        "开始激活.command",
+        "docs",
+        "licenses",
+    },
+}
