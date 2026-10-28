@@ -8,13 +8,9 @@
 
 仓库只保存源码、脚本和文档；应用副本、配套私钥、编译产物和签名备份均不上传。
 
-先退出正在运行的 Navicat，然后在终端执行这一条：
+先退出正在运行的 Navicat，且断网
 
-```bash
-~/Downloads/lejav-gen-navicat/bin/lejav-gen-navicat activate
-```
-
-也可以在这个文件夹里双击 **`开始激活.command`**。
+双击 **`开始激活.command`**。
 
 工具会自动准备密钥、处理应用副本、检查签名并打开应用。
 接着按终端提示做三步：
