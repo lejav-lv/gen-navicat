@@ -1,4 +1,5 @@
-//! Native macOS entry point. Patch always publishes a separate, signed app copy.
+//! Native macOS entry point. Activate updates the installed app with a backup;
+//! patch and activate --out retain the separate-copy workflow.
 const std = @import("std");
 const builtin = @import("builtin");
 const macho = @import("macho.zig");
@@ -14,7 +15,7 @@ const manifest_relative = "Contents/Resources/lejav-gen-navicat-patch.json";
 const usage =
     \\lejav-gen-navicat (macOS Apple Silicon) <command> [options]
     \\
-    \\  activate          一条命令启动引导流程（推荐）；最后在注册窗口复制/粘贴
+    \\  activate          备份并处理原位置应用，再启动激活引导
     \\  doctor / status   Inspect application, ARM64 slice and patch status (read only)
     \\  repair-signature  修复本工具旧副本的本地签名（activate 会自动处理）
     \\  keygen            Generate an RSA-2048 PEM private key (mode 0600)
@@ -23,7 +24,7 @@ const usage =
     \\  sign              Generate a manual activation response from a request
     \\
     \\activate:      [--name <name>] [--org <org>] [--prepare-only]
-    \\               [--app <source.app>] [--out <new.app>] [--key <pem>]
+    \\               [--app <installed.app>] [--out <separate.app>] [--key <pem>]
     \\doctor/status: [--app <app>] [--key <pem>]
     \\keygen:        [--out <pem>] [--force]
     \\serial:        [--version 18] [--language SimplifiedChinese] [--product Premium]
@@ -33,7 +34,8 @@ const usage =
     \\Default app: /Applications/Navicat Premium.app
     \\Default key: RegPrivateKey.pem
     \\Patch profile: Navicat Premium 18.0.5 (321), macOS arm64 only.
-    \\Other versions fail before writing. Existing output paths are never overwritten.
+    \\activate updates --app in place with an original backup; --out selects a separate copy.
+    \\Other versions fail before writing. Explicit --out paths are never overwritten.
     \\The patch command does not claim activation; complete manual activation in the app.
     \\This macOS-only tool uses manual activation; it does not edit hosts.
     \\
@@ -386,7 +388,121 @@ fn requireNavicatClosed(allocator: std.mem.Allocator, io: std.Io) !void {
     defer allocator.free(result.stderr);
     if (result.term != .exited) return error.ExternalCommandFailed;
     if (result.term.exited == 0) return error.NavicatAlreadyRunning;
-    if (result.term.exited != 1) return error.ExternalCommandFailed;
+    if (result.term.exited != 1) {
+        try std.Io.File.stderr().writeStreamingAll(io, result.stderr);
+        return error.ProcessCheckFailed;
+    }
+}
+
+// Both directories remain present across this operation, including interruption.
+// Never fall back to deleting or incrementally overwriting the installed bundle.
+fn exchangePaths(allocator: std.mem.Allocator, first: []const u8, second: []const u8) !void {
+    const first_z = try allocator.dupeSentinel(u8, first, 0);
+    defer allocator.free(first_z);
+    const second_z = try allocator.dupeSentinel(u8, second, 0);
+    defer allocator.free(second_z);
+    switch (std.c.errno(std.c.renameatx_np(std.c.AT.FDCWD, first_z, std.c.AT.FDCWD, second_z, .{ .SWAP = true, .NOFOLLOW_ANY = true }))) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return error.AccessDenied,
+        .NOENT => return error.FileNotFound,
+        else => return error.AtomicExchangeFailed,
+    }
+}
+
+test "atomic app replacement preserves original and can be reversed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDir(io, "installed.app", .default_dir);
+    try temp.dir.createDirPath(io, "backup/installed.app");
+    try temp.dir.writeFile(io, .{ .sub_path = "installed.app/content", .data = "original" });
+    try temp.dir.writeFile(io, .{ .sub_path = "backup/installed.app/content", .data = "patched" });
+    const installed = try temp.dir.realPathFileAlloc(io, "installed.app", allocator);
+    defer allocator.free(installed);
+    const backup = try temp.dir.realPathFileAlloc(io, "backup/installed.app", allocator);
+    defer allocator.free(backup);
+    const original_stat = try temp.dir.statFile(io, "installed.app", .{});
+    const patched_stat = try temp.dir.statFile(io, "backup/installed.app", .{});
+    try exchangePaths(allocator, installed, backup);
+    try std.testing.expectEqual(original_stat.inode, (try temp.dir.statFile(io, "backup/installed.app", .{})).inode);
+    try std.testing.expectEqual(patched_stat.inode, (try temp.dir.statFile(io, "installed.app", .{})).inode);
+    try exchangePaths(allocator, installed, backup);
+    try std.testing.expectEqual(original_stat.inode, (try temp.dir.statFile(io, "installed.app", .{})).inode);
+    const missing = try join(allocator, backup, "missing");
+    defer allocator.free(missing);
+    try std.testing.expectError(error.FileNotFound, exchangePaths(allocator, installed, missing));
+    try std.testing.expectEqual(original_stat.inode, (try temp.dir.statFile(io, "installed.app", .{})).inode);
+}
+
+fn verifyOrRepair(allocator: std.mem.Allocator, io: std.Io, app: []const u8, key: []const u8) !void {
+    status(allocator, io, .{ .app = app, .key = key, .explicit_key = true, .quiet = true }) catch |err| switch (err) {
+        error.LocalSignatureNeedsRepair => {
+            try print(io, "检测到旧版签名配置，正在修复启动兼容性…\n", .{});
+            try repairSignature(allocator, io, .{ .app = app, .key = key, .explicit_key = true, .quiet = true });
+        },
+        else => return err,
+    };
+}
+
+fn prepareInstalledApp(allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
+    try requireNavicatClosed(allocator, io);
+    const source_stat = try std.Io.Dir.cwd().statFile(io, options.app, .{ .follow_symlinks = false });
+    if (source_stat.kind != .directory) return error.AppMustBeDirectory;
+    const app = try appPath(allocator, io, options.app);
+    defer allocator.free(app);
+    try validateBundleLinks(allocator, io, app);
+    const library = try join(allocator, app, library_relative);
+    defer allocator.free(library);
+    const original = try read(allocator, io, library, 512 << 20);
+    defer allocator.free(original);
+    const image = try macho.Image.parse(original);
+    if (macho.installedKey(image) != null) {
+        if (!try exists(io, options.key)) return error.MissingMatchingKey;
+        try verifyOrRepair(allocator, io, app, options.key);
+        return;
+    }
+    // Reject unknown versions before creating a key or backup directory.
+    try image.requireSupported();
+    const key_parent_raw = std.fs.path.dirname(options.key) orelse ".";
+    if (!options.explicit_key) try std.Io.Dir.cwd().createDirPath(io, key_parent_raw);
+    const key_parent = try std.Io.Dir.cwd().realPathFileAlloc(io, key_parent_raw, allocator);
+    defer allocator.free(key_parent);
+    if (isInside(key_parent, app)) return error.PrivateKeyInsideApp;
+    if (!try exists(io, options.key)) try keygen(allocator, io, .{ .out = options.key, .quiet = true });
+    var random: [12]u8 = undefined;
+    io.random(&random);
+    const backup_dir = try std.fmt.allocPrint(allocator, "{s}.original-backup-{s}", .{ app, std.fmt.bytesToHex(&random, .lower) });
+    defer allocator.free(backup_dir);
+    const backup_app = try join(allocator, backup_dir, std.fs.path.basename(app));
+    defer allocator.free(backup_app);
+    try std.Io.Dir.cwd().createDir(io, backup_dir, .fromMode(0o700));
+    var keep_backup = false;
+    defer if (!keep_backup) {
+        std.Io.Dir.cwd().deleteTree(io, backup_dir) catch {};
+    };
+    // Prepare and verify everything away from the installed app. After the swap,
+    // this location contains the untouched original, not the prepared bundle.
+    try patchApp(allocator, io, .{ .app = app, .out = backup_app, .key = options.key, .quiet = true });
+    try status(allocator, io, .{ .app = backup_app, .key = options.key, .explicit_key = true, .quiet = true });
+    try requireNavicatClosed(allocator, io);
+    const current_stat = try std.Io.Dir.cwd().statFile(io, app, .{ .follow_symlinks = false });
+    if (current_stat.kind != .directory or current_stat.inode != source_stat.inode) return error.SourceChangedDuringCopy;
+    const current = try read(allocator, io, library, 512 << 20);
+    defer allocator.free(current);
+    if (!std.mem.eql(u8, &macho.digest(original), &macho.digest(current))) return error.SourceChangedDuringCopy;
+    try print(io, "原位置：{s}\n原文件备份将保留在：{s}\n", .{ app, backup_app });
+    try exchangePaths(allocator, app, backup_app);
+    keep_backup = true;
+    status(allocator, io, .{ .app = app, .key = options.key, .explicit_key = true, .quiet = true }) catch |err| {
+        exchangePaths(allocator, app, backup_app) catch {
+            std.debug.print("替换后校验失败，自动回退未成功；原文件仍保留在：{s}\n", .{backup_app});
+            return error.RestoreFailed;
+        };
+        keep_backup = false;
+        return err;
+    };
+    try print(io, "原位置应用已更新，完整备份已保留。激活状态仍需在注册窗口确认。\n", .{});
 }
 
 fn activate(allocator: std.mem.Allocator, io: std.Io, init: std.process.Init, options: Options) !void {
@@ -401,27 +517,25 @@ fn activate(allocator: std.mem.Allocator, io: std.Io, init: std.process.Init, op
     defer allocator.free(artifacts);
     const key_path = if (options.explicit_key) try allocator.dupe(u8, options.key) else try join(allocator, artifacts, "RegPrivateKey.pem");
     defer allocator.free(key_path);
-    const output = if (options.out) |path| try allocator.dupe(u8, path) else try join(allocator, artifacts, "Navicat Premium ARM64.app");
+    const output = try allocator.dupe(u8, options.out orelse options.app);
     defer allocator.free(output);
-    const has_app = try exists(io, output);
-    const has_key = try exists(io, key_path);
-    if (has_app and !has_key) return error.MissingMatchingKey;
-    try print(io, "\nlejav-gen-navicat 激活引导\n\n[1/3] 准备并检查应用副本…\n", .{});
-    if (!has_app) {
-        // Unknown input fails before creating a private key or an output folder.
-        try status(allocator, io, .{ .app = options.app, .quiet = true });
-        if (options.out == null or !options.explicit_key) try std.Io.Dir.cwd().createDirPath(io, artifacts);
-        if (!has_key) try keygen(allocator, io, .{ .out = key_path, .quiet = true });
-        try patchApp(allocator, io, .{ .app = options.app, .key = key_path, .out = output, .quiet = true });
+    try print(io, "\nlejav-gen-navicat 激活引导\n\n[1/3] 准备并检查{s}…\n", .{if (options.out == null) "原位置应用（保留原文件备份）" else "应用副本"});
+    if (options.out == null) {
+        try prepareInstalledApp(allocator, io, .{ .app = output, .key = key_path, .explicit_key = options.explicit_key });
+    } else {
+        const has_app = try exists(io, output);
+        const has_key = try exists(io, key_path);
+        if (has_app and !has_key) return error.MissingMatchingKey;
+        if (!has_app) {
+            // Unknown input fails before creating a private key or an output folder.
+            try status(allocator, io, .{ .app = options.app, .quiet = true });
+            if (!options.explicit_key) try std.Io.Dir.cwd().createDirPath(io, artifacts);
+            if (!has_key) try keygen(allocator, io, .{ .out = key_path, .quiet = true });
+            try patchApp(allocator, io, .{ .app = options.app, .key = key_path, .out = output, .quiet = true });
+        }
+        try verifyOrRepair(allocator, io, output, key_path);
     }
-    status(allocator, io, .{ .app = output, .key = key_path, .explicit_key = true, .quiet = true }) catch |err| switch (err) {
-        error.LocalSignatureNeedsRepair => {
-            try print(io, "检测到旧版签名配置，正在修复启动兼容性…\n", .{});
-            try repairSignature(allocator, io, .{ .app = output, .key = key_path, .explicit_key = true, .quiet = true });
-        },
-        else => return err,
-    };
-    try print(io, "应用副本和配套密钥检查通过。\n", .{});
+    try print(io, "应用和配套密钥检查通过。\n当前目标：{s}\n", .{output});
     if (options.prepare_only) {
         return print(io, "\n准备完成。未启动应用、未访问剪贴板，也未执行界面激活。\n", .{});
     }
@@ -435,7 +549,7 @@ fn activate(allocator: std.mem.Allocator, io: std.Io, init: std.process.Init, op
     runCommand(allocator, io, &.{ "/usr/bin/open", "-n", output }) catch return error.ApplicationLaunchFailed;
     try print(
         io,
-        "\n[2/3] 已打开应用副本，序列号已复制：{s}\n" ++
+        "\n[2/3] 已打开目标应用，序列号已复制：{s}\n" ++
             "在 Navicat 菜单 → 注册 中粘贴序列号。\n" ++
             "先保存联网工作，临时断开 Wi-Fi/网线，再点“激活”；若出现“手动激活”，点击进入。\n" ++
             "请求码是该窗口中的一长段文本；90010003 是错误码，不是请求码。\n" ++
@@ -457,7 +571,7 @@ fn activate(allocator: std.mem.Allocator, io: std.Io, init: std.process.Init, op
         const signed = license.sign(allocator, key, request, name, org, std.Io.Clock.real.now(io).toSeconds()) catch |err| {
             switch (err) {
                 error.InvalidRequestCode, error.SigningFailed, error.NotMacRequest, error.MissingField => {
-                    try print(io, "读取到的内容不是此副本的有效请求码（{s}）。\n请复制“请求码”区域的完整内容，再按回车重试。\n", .{@errorName(err)});
+                    try print(io, "读取到的内容不是此应用的有效请求码（{s}）。\n请复制“请求码”区域的完整内容，再按回车重试。\n", .{@errorName(err)});
                     continue;
                 },
                 else => return err,

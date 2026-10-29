@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
         return std.Io.File.stdout().writeStreamingAll(init.io, cli.usageText());
     }
     if (std.mem.eql(u8, args[1], "version") or std.mem.eql(u8, args[1], "--version")) {
-        return std.Io.File.stdout().writeStreamingAll(init.io, "lejav-gen-navicat 0.4.1 (macos/arm64)\n");
+        return std.Io.File.stdout().writeStreamingAll(init.io, "lejav-gen-navicat 0.5.0 (macos/arm64)\n");
     }
     cli.run(init.gpa, init.io, init, args[1..]) catch |err| {
         std.debug.print("error: {s}\n", .{explain(err)});
@@ -32,7 +32,7 @@ fn explain(err: anyerror) []const u8 {
         error.OutputInsideSource => "输出不能等于原应用或位于原应用内部。",
         error.ExternalBundleSymlink => "应用包含指向包外的符号链接，已停止复制补丁流程。",
         error.PrivateKeyInsideApp => "私钥必须存放在应用包之外。",
-        error.KeyMismatch => "私钥与应用副本中的公钥不匹配。",
+        error.KeyMismatch => "私钥与目标应用中的公钥不匹配。",
         error.PatchVerificationFailed => "补丁或文件摘要校验失败。",
         error.SourceChangedDuringCopy => "复制过程中源文件发生变化，请在更新完成后重试。",
         error.NotMacRequest => "请求码不是 MAC 平台请求码。",
@@ -40,22 +40,26 @@ fn explain(err: anyerror) []const u8 {
         error.MissingOrganization => "缺少 --org 组织名。",
         error.MissingRequest => "缺少 --request 请求码，推荐使用 --request @request.txt。",
         error.InvalidRequestCode => "请求码应为 Base64 编码的 256 字节密文。",
-        error.SigningFailed => "此私钥无法解开请求码，请确认请求来自使用同一密钥处理过的应用副本。",
+        error.SigningFailed => "此私钥无法解开请求码，请确认请求来自使用同一密钥处理过的目标应用。",
         error.PayloadTooLarge => "注册信息过长，请缩短名称或组织名。",
         error.OutputExists, error.PathAlreadyExists => "输出路径已存在；请选择新路径。只有 keygen 支持 --force 替换密钥。",
         error.FileNotFound => "文件或目录不存在，请检查 --app、--key、--request 和输出父目录。",
         error.AccessDenied, error.PermissionDenied => "无法访问该路径，请选择当前用户可读写的目录。",
-        error.MissingMatchingKey => "已有应用副本，但找不到配套私钥；请找回原私钥，或用 --out 选择新副本路径。",
+        error.MissingMatchingKey => "已有处理过的应用，但找不到配套私钥；请找回原私钥并用 --key 指定，不要重新生成。",
         error.NavicatAlreadyRunning => "请先手动退出正在运行的 Navicat，再运行 activate。工具不会强制关闭连接。",
+        error.ProcessCheckFailed => "无法确认 Navicat 是否已退出，已停止文件操作；请在允许查询进程的本机终端重试。",
+        error.AppMustBeDirectory => "原位置模式要求 --app 指向真实应用目录，不能是符号链接。",
+        error.AtomicExchangeFailed => "无法原子替换应用目录，原位置应用未被替换；请检查目录权限及文件系统支持。",
+        error.RestoreFailed => "替换后的校验和自动回退失败。请保留上方备份路径，用其中的原应用恢复；不要删除备份。",
         error.InteractiveTerminalRequired => "activate 的引导需要交互终端；只准备文件请使用 --prepare-only。",
-        error.UserCanceled => "已退出引导；应用副本和私钥已保留，可以稍后重新运行 activate。",
+        error.UserCanceled => "已退出引导；已准备的应用、备份和私钥均已保留，可以稍后重新运行 activate。",
         error.ClipboardFailed => "无法访问剪贴板，请在本机桌面终端运行。",
         error.MissingValue => "命令参数缺少值，运行 lejav-gen-navicat --help 查看用法。",
         error.UnknownOption, error.UnknownCommand => "未知命令或参数，运行 lejav-gen-navicat --help 查看用法。",
         error.UnsupportedVersion => "序列号生成支持 16–31；应用补丁仅支持已验证的 18.0.5 (321)。",
         error.UnexpectedApplication => "--app 必须指向 Navicat Premium.app。",
-        error.LocalSignatureNeedsRepair => "副本仍携带原厂受限权限，无法使用本地签名启动。运行 activate 将自动修复。",
-        error.ApplicationLaunchFailed => "应用副本已准备并保留，但启动失败。请保留上方系统错误；这不代表补丁生成失败。",
+        error.LocalSignatureNeedsRepair => "处理过的应用仍携带原厂受限权限，无法使用本地签名启动。运行 activate 将自动修复。",
+        error.ApplicationLaunchFailed => "目标应用已准备并保留，但启动失败。请保留上方系统错误；这不代表补丁生成失败。",
         error.ExternalCommandFailed => "系统命令执行失败，具体原因见上方输出。",
         else => @errorName(err),
     };

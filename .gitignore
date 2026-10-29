@@ -10,6 +10,7 @@ response*.txt
 *.p12
 *.pfx
 *.signature-backup-*/
+*.original-backup-*/
 .env
 .env.*
 !.env.example
