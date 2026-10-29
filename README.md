@@ -25,3 +25,7 @@
 “请求码”是手动激活窗口中生成的一长段文本，不是序列号，也不是 `90010003` 错误码。
 如果只看到 `90010003` 和“好”，说明还没进入请求码页面；断网后仍没有“手动激活”时，先停止，不要将错误码粘贴进终端。完成或取消后恢复网络。
 [Navicat 18 Mac 官方手册（Registration）](https://www.navicat.com/manual/pdf_manual/en/navicat_18/mac_manual/navicat_mac_en.pdf) 说明手动激活适用于没有互联网连接的情况；当前尚未实测本机断网后的入口。
+
+## Community
+
+- **[linux.do](https://linux.do)** - A thriving developer community.
